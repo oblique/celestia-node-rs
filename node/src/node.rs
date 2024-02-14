@@ -19,6 +19,8 @@ use libp2p::swarm::NetworkInfo;
 use libp2p::{Multiaddr, PeerId};
 
 use crate::network::Network;
+use crate::node_builder::no_blockstore::NoBlockstore;
+use crate::node_builder::no_store::NoStore;
 use crate::p2p::{P2p, P2pError};
 use crate::peer_tracker::PeerTrackerInfo;
 use crate::store::{Store, StoreError};
@@ -54,6 +56,12 @@ where
     store: Arc<S>,
 }
 
+impl Node<NoStore> {
+    pub fn builder() -> NodeBuilder<NoBlockstore, NoStore> {
+        NodeBuilder::new()
+    }
+}
+
 impl<S> Node<S>
 where
     S: Store,
@@ -61,20 +69,6 @@ where
     /// Creates and starts a new celestia node with a given config.
     pub(crate) fn new(p2p: Arc<P2p>, syncer: Arc<Syncer<S>>, store: Arc<S>) -> Self {
         Node { p2p, store, syncer }
-    }
-
-    pub fn builder<B>() -> NodeBuilder<B, S>
-    where
-        B: Blockstore + 'static,
-    {
-        NodeBuilder::new()
-    }
-
-    pub fn from_network<B>(network: Network) -> NodeBuilder<B, S>
-    where
-        B: Blockstore + 'static,
-    {
-        NodeBuilder::from_network(network)
     }
 
     /// Get node's local peer ID.

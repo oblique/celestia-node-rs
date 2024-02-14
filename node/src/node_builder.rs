@@ -1,16 +1,25 @@
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use blockstore::{Blockstore, BlockstoreError};
 use celestia_types::hash::Hash;
+use futures::future::BoxFuture;
 use libp2p::identity::Keypair;
 use libp2p::Multiaddr;
 
+pub(crate) mod no_blockstore;
+pub(crate) mod no_store;
+
+use crate::blockstore::SledBlockstore;
 use crate::network::Network;
 use crate::node::Node;
 use crate::p2p::{P2p, P2pArgs, P2pError};
-use crate::store::{Store, StoreError};
+use crate::store::{SledStore, Store, StoreError};
 use crate::syncer::{Syncer, SyncerArgs, SyncerError};
+
+use self::no_blockstore::NoBlockstore;
+use self::no_store::NoStore;
 
 type Result<T, E = NodeBuilderError> = std::result::Result<T, E>;
 
@@ -59,17 +68,19 @@ where
     /// List of the addresses where [`Node`] will listen for incoming connections.
     p2p_listen_on: Vec<Multiaddr>,
     /// The blockstore for bitswap.
-    blockstore: Option<B>,
+    blockstore: Option<StoreKind<B>>,
     /// The store for headers.
-    store: Option<S>,
+    store: Option<StoreKind<S>>,
 }
 
-impl<B, S> Default for NodeBuilder<B, S>
-where
-    B: Blockstore,
-    S: Store,
-{
-    fn default() -> Self {
+enum StoreKind<S> {
+    #[cfg(not(target_arch = "wasm32"))]
+    InitWithSledDb(Box<dyn FnOnce(sled::Db) -> BoxFuture<'static, Result<S, NodeBuilderError>>>),
+    Value(S),
+}
+
+impl NodeBuilder<NoBlockstore, NoStore> {
+    pub fn new() -> Self {
         Self {
             network: None,
             genesis_hash: None,
@@ -87,10 +98,6 @@ where
     B: Blockstore + 'static,
     S: Store,
 {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_network(mut self, network: Network) -> Self {
         self.network = Some(network);
         self
@@ -116,51 +123,80 @@ where
         self
     }
 
-    pub fn with_blockstore(mut self, blockstore: B) -> Self {
-        self.blockstore = Some(blockstore);
-        self
+    pub fn with_blockstore<NEW_B>(self, blockstore: NEW_B) -> NodeBuilder<NEW_B, S>
+    where
+        NEW_B: Blockstore,
+    {
+        NodeBuilder {
+            network: self.network,
+            genesis_hash: self.genesis_hash,
+            p2p_local_keypair: self.p2p_local_keypair,
+            p2p_bootnodes: self.p2p_bootnodes,
+            p2p_listen_on: self.p2p_listen_on,
+            blockstore: Some(StoreKind::Value(blockstore)),
+            store: self.store,
+        }
     }
 
-    pub fn with_store(mut self, store: S) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    pub fn from_network(network: Network) -> Self {
-        Self::new()
-            .with_network(network)
-            .with_genesis(network.genesis())
-            .with_bootnodes(network.canonical_bootnodes().collect())
+    pub fn with_store<NEW_S>(self, store: NEW_S) -> NodeBuilder<B, NEW_S>
+    where
+        NEW_S: Store,
+    {
+        NodeBuilder {
+            network: self.network,
+            genesis_hash: self.genesis_hash,
+            p2p_local_keypair: self.p2p_local_keypair,
+            p2p_bootnodes: self.p2p_bootnodes,
+            p2p_listen_on: self.p2p_listen_on,
+            blockstore: self.blockstore,
+            store: Some(StoreKind::Value(store)),
+        }
     }
 
     pub async fn build(self) -> Result<Node<S>> {
         let network = self.network.ok_or(NodeBuilderError::NetworkMissing)?;
+        let genesis_hash = self.genesis_hash.or_else(|| network.genesis());
+
+        let bootnodes = if self.p2p_bootnodes.is_empty() {
+            network.canonical_bootnodes().collect()
+        } else {
+            self.p2p_bootnodes
+        };
+
+        let store = self.store.expect("todo");
+        let blockstore = self.blockstore.expect("todo");
+
         let local_keypair = self
             .p2p_local_keypair
             .unwrap_or_else(Keypair::generate_ed25519);
 
-        if self.blockstore.is_none() || self.store.is_none() {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let db = native::default_sled_db(network).await?;
-                if self.blockstore.is_none() {
-                    let blockstore = crate::blockstore::SledBlockstore::new(db.clone()).await?;
-                    self.blockstore = Some(blockstore);
-                }
-                if self.store.is_none() {
-                    let store = crate::store::SledStore::new(db).await?;
-                    self.store = Some(store);
-                }
-            }
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let sled_db = if matches!(blockstore, StoreKind::InitWithSledDb(_))
+            || matches!(store, StoreKind::InitWithSledDb(_))
+        {
+            Some(native::default_sled_db(&network).await?)
+        } else {
+            None
+        };
 
-        let blockstore = self.blockstore.unwrap();
-        let store = Arc::new(self.store.unwrap());
+        let blockstore = match blockstore {
+            #[cfg(not(target_arch = "wasm32"))]
+            StoreKind::InitWithSledDb(f) => f(sled_db.clone().unwrap()).await?,
+            StoreKind::Value(blockstore) => blockstore,
+        };
+
+        let store = match store {
+            #[cfg(not(target_arch = "wasm32"))]
+            StoreKind::InitWithSledDb(f) => f(sled_db.clone().unwrap()).await?,
+            StoreKind::Value(store) => store,
+        };
+
+        let store = Arc::new(store);
 
         let p2p = Arc::new(P2p::start(P2pArgs {
             network,
             local_keypair,
-            bootnodes: self.p2p_bootnodes,
+            bootnodes,
             listen_on: self.p2p_listen_on,
             blockstore,
             store: store.clone(),
@@ -181,20 +217,21 @@ mod native {
     use std::path::Path;
 
     use directories::ProjectDirs;
-    use tokio::{fs, task::spawn_blocking};
+    use futures::FutureExt;
+    use tokio::task::spawn_blocking;
     use tracing::warn;
 
     use crate::{blockstore::SledBlockstore, store::SledStore, utils};
 
     use super::*;
 
-    pub(super) async fn default_sled_db(network: Network) -> Result<sled::Db> {
+    pub(super) async fn default_sled_db(network: &Network) -> Result<sled::Db> {
         let network_id = network.id();
         let mut data_dir = utils::data_dir()
             .ok_or_else(|| StoreError::OpenFailed("Can't find home of current user".into()))?;
 
         // TODO(02.2024): remove in 3 months or after few releases
-        migrate_from_old_cache_dir(&data_dir).await?;
+        //migrate_from_old_cache_dir(&data_dir).await?;
 
         data_dir.push(network_id);
         data_dir.push("db");
@@ -212,34 +249,36 @@ mod native {
         B: Blockstore,
         S: Store,
     {
-        pub async fn with_default_blockstore(mut self) -> Result<Self> {
-            let db = self.get_sled_db().await?;
-            self.blockstore = Some(SledBlockstore::new(db).await?);
-            Ok(self)
+        pub fn with_default_blockstore(self) -> NodeBuilder<SledBlockstore, S> {
+            NodeBuilder {
+                network: self.network,
+                genesis_hash: self.genesis_hash,
+                p2p_local_keypair: self.p2p_local_keypair,
+                p2p_bootnodes: self.p2p_bootnodes,
+                p2p_listen_on: self.p2p_listen_on,
+                blockstore: Some(StoreKind::InitWithSledDb(Box::new(|db| {
+                    async move { Ok(SledBlockstore::new(db).await?) }.boxed()
+                }))),
+                store: self.store,
+            }
+        }
+
+        pub fn with_default_store(self) -> NodeBuilder<B, SledStore> {
+            NodeBuilder {
+                network: self.network,
+                genesis_hash: self.genesis_hash,
+                p2p_local_keypair: self.p2p_local_keypair,
+                p2p_bootnodes: self.p2p_bootnodes,
+                p2p_listen_on: self.p2p_listen_on,
+                blockstore: self.blockstore,
+                store: Some(StoreKind::InitWithSledDb(Box::new(|db| {
+                    async move { Ok(SledStore::new(db).await?) }.boxed()
+                }))),
+            }
         }
     }
 
-    impl<B> NodeBuilder<B, SledStore>
-    where
-        B: Blockstore,
-    {
-        pub async fn with_default_store(mut self) -> Result<Self> {
-            let db = self.get_sled_db().await?;
-            self.store = Some(SledStore::new(db).await?);
-            Ok(self)
-        }
-    }
-
-    impl NodeBuilder<SledBlockstore, SledStore> {
-        pub async fn from_network_with_defaults(network: Network) -> Result<Self> {
-            Self::from_network(network)
-                .with_default_blockstore()
-                .await?
-                .with_default_store()
-                .await
-        }
-    }
-
+    /*
     // TODO(02.2024): remove in 3 months or after few releases
     // Previously we used `.cache/celestia/{network_id}` (or os equivalent) for
     // sled's persistent storage. This function will migrate it to a new lumina
@@ -297,4 +336,5 @@ mod native {
 
         Ok(())
     }
+    */
 }

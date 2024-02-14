@@ -55,19 +55,10 @@ pub(crate) async fn run(args: Params) -> Result<()> {
         args.bootnodes
     };
 
-    info!("Initializing store");
-    let db = open_db(args.store, &network_id).await?;
-    let store = SledStore::new(db.clone()).await?;
-    let blockstore = SledBlockstore::new(db).await?;
-
-    match store.head_height().await {
-        Ok(height) => info!("Initialised store with head height: {height}"),
-        Err(_) => info!("Initialised new store"),
-    }
-
-    let node = NodeBuilder::from_network_with_defaults(network)
-        .await?
-        .with_bootnodes(bootnodes)
+    let node = Node::builder()
+        .with_network(network)
+        .with_default_blockstore()
+        .with_default_store()
         .build()
         .await
         .context("Failed to start node")?;
@@ -77,13 +68,6 @@ pub(crate) async fn run(args: Params) -> Result<()> {
     // We have nothing else to do, but we want to keep main alive
     loop {
         sleep(Duration::from_secs(1)).await;
-    }
-}
-
-async fn open_db(path: Option<PathBuf>, network_id: &str) -> Result<Db> {
-    if let Some(path) = path {
-        let db = spawn_blocking(|| sled::open(path)).await??;
-        return Ok(db);
     }
 }
 
