@@ -79,7 +79,9 @@ mod imp {
                 // TODO: Refactor code to avoid being idle. This can be done by preloading a
                 // handler. This is how they fixed Kademlia:
                 // https://github.com/libp2p/rust-libp2p/pull/4675/files
-                config.with_idle_connection_timeout(Duration::from_secs(15))
+                config
+                    .with_idle_connection_timeout(Duration::from_secs(15))
+                    .with_dial_concurrency_factor(1.try_into().unwrap())
             })
             .build())
     }

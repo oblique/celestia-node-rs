@@ -1,9 +1,10 @@
 use celestia_proto::p2p::pb::HeaderRequest;
 use celestia_types::ExtendedHeader;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
-use crate::executor::spawn;
+use crate::executor::{sleep, spawn};
 use crate::p2p::header_ex::utils::HeaderRequestExt;
 use crate::p2p::{HeaderExError, P2pCmd, P2pError};
 
@@ -60,6 +61,7 @@ impl HeaderSession {
                     responses.push(headers);
 
                     if headers_len < requested_amount {
+                        sleep(Duration::from_secs(1)).await;
                         // Reschedule the missing sub-range
                         let height = height + headers_len;
                         let amount = requested_amount - headers_len;
@@ -108,26 +110,33 @@ impl HeaderSession {
     }
 
     pub(crate) async fn send_request(&mut self, height: u64, amount: u64) -> Result<()> {
-        debug!("Fetching batch {} until {}", height, height + amount - 1);
+        tracing::info!("Fetching batch {} until {}", height, height + amount - 1);
 
-        let request = HeaderRequest::with_origin(height, amount);
-        let (tx, rx) = oneshot::channel();
-
-        self.cmd_tx
-            .send(P2pCmd::HeaderExRequest {
-                request,
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| P2pError::WorkerDied)?;
-
+        let cmd_tx = self.cmd_tx.clone();
         let response_tx = self.response_tx.clone();
 
+        // TODO: somehow produce error?
+
         spawn(async move {
-            let result = match rx.await {
-                Ok(result) => result,
-                Err(_) => Err(P2pError::WorkerDied),
-            };
+            let request = HeaderRequest::with_origin(height, amount);
+            let (tx, rx) = oneshot::channel();
+
+            let result = async move {
+                cmd_tx
+                    .send(P2pCmd::HeaderExRequest {
+                        request,
+                        respond_to: tx,
+                    })
+                    .await
+                    .map_err(|_| P2pError::WorkerDied)?;
+
+                match rx.await {
+                    Ok(res) => res,
+                    Err(_) => Err(P2pError::WorkerDied),
+                }
+            }
+            .await;
+
             let _ = response_tx.send((height, amount, result)).await;
         });
 
