@@ -238,13 +238,13 @@ impl NodeWorker {
 #[wasm_bindgen]
 pub async fn run_worker(queued_events: Vec<MessageEvent>) -> Result<()> {
     info!("Entered run_worker");
-    let (tx, mut rx) = mpsc::channel(WORKER_MESSAGE_SERVER_INCOMING_QUEUE_LENGTH);
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let events_channel_name = format!("NodeEventChannel-{}", get_crypto()?.random_uuid());
 
     let mut message_server: Box<dyn MessageServer> = if SharedWorker::is_worker_type() {
-        Box::new(SharedWorkerMessageServer::new(tx.clone(), queued_events))
+        Box::new(SharedWorkerMessageServer::new(tx, queued_events))
     } else {
-        Box::new(DedicatedWorkerMessageServer::new(tx.clone(), queued_events).await)
+        Box::new(DedicatedWorkerMessageServer::new(tx, queued_events))
     };
 
     info!("Entering worker message loop");

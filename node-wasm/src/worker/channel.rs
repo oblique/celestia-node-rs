@@ -28,7 +28,7 @@ const WORKER_CHANNEL_SIZE: usize = 1;
 /// simple RPC-like function call interface.
 pub(crate) struct WorkerClient {
     worker: AnyWorker,
-    response_channel: Mutex<mpsc::Receiver<WireMessage>>,
+    response_channel: Mutex<mpsc::UnboundedReceiver<WireMessage>>,
     _onmessage: Closure<dyn Fn(MessageEvent)>,
     _onerror: Closure<dyn Fn(MessageEvent)>,
 }
@@ -37,7 +37,7 @@ impl WorkerClient {
     /// Create a new WorkerClient to control newly created Shared or Dedicated Worker running
     /// MessageServer
     pub(crate) fn new(worker: AnyWorker) -> Self {
-        let (response_tx, response_rx) = mpsc::channel(WORKER_CHANNEL_SIZE);
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
 
         let onmessage = worker.setup_on_message_callback(response_tx);
         let onerror = worker.setup_on_error_callback();
@@ -126,24 +126,21 @@ impl AnyWorker {
 
     fn setup_on_message_callback(
         &self,
-        response_tx: mpsc::Sender<WireMessage>,
+        response_tx: mpsc::UnboundedSender<WireMessage>,
     ) -> Closure<dyn Fn(MessageEvent)> {
         let onmessage_callback = move |ev: MessageEvent| {
-            let response_tx = response_tx.clone();
-            spawn_local(async move {
-                let data: WireMessage = match from_value(ev.data()) {
-                    Ok(jsvalue) => jsvalue,
-                    Err(e) => {
-                        error!("WorkerClient could not convert from JsValue: {e}");
-                        let error = Error::from(e).context("could not deserialise worker response");
-                        Err(WorkerError::WorkerCommunicationError(error))
-                    }
-                };
-
-                if let Err(e) = response_tx.send(data).await {
-                    error!("message forwarding channel closed, should not happen: {e}");
+            let data: WireMessage = match from_value(ev.data()) {
+                Ok(jsvalue) => jsvalue,
+                Err(e) => {
+                    error!("WorkerClient could not convert from JsValue: {e}");
+                    let error = Error::from(e).context("could not deserialise worker response");
+                    Err(WorkerError::WorkerCommunicationError(error))
                 }
-            })
+            };
+
+            if let Err(e) = response_tx.send(data) {
+                error!("message forwarding channel closed, should not happen: {e}");
+            }
         };
 
         let onmessage = Closure::new(onmessage_callback);
@@ -230,13 +227,19 @@ pub(super) struct SharedWorkerMessageServer {
     clients: Vec<WorkerClientConnection>,
 
     // sends events back to the main loop for processing
-    command_channel: mpsc::Sender<WorkerMessage>,
+    command_channel: mpsc::UnboundedSender<WorkerMessage>,
 }
 
 impl SharedWorkerMessageServer {
-    pub fn new(command_channel: mpsc::Sender<WorkerMessage>, queued: Vec<MessageEvent>) -> Self {
+    pub fn new(
+        command_channel: mpsc::UnboundedSender<WorkerMessage>,
+        queued: Vec<MessageEvent>,
+    ) -> Self {
         let worker_scope = SharedWorker::worker_self();
         let onconnect = get_client_connect_callback(command_channel.clone());
+
+        // TODO: shouldn't we read the JS `queued` variable after we replce
+        // JS's `onconnect` with ours?
         worker_scope.set_onconnect(Some(onconnect.as_ref().unchecked_ref()));
 
         let mut server = Self {
@@ -293,14 +296,14 @@ pub(super) struct DedicatedWorkerMessageServer {
 }
 
 impl DedicatedWorkerMessageServer {
-    pub async fn new(
-        command_channel: mpsc::Sender<WorkerMessage>,
+    pub fn new(
+        command_channel: mpsc::UnboundedSender<WorkerMessage>,
         queued: Vec<MessageEvent>,
     ) -> Self {
         for event in queued {
             let message = WorkerMessage::from((event, ClientId(0)));
 
-            if let Err(e) = command_channel.send(message).await {
+            if let Err(e) = command_channel.send(message) {
                 error!("command channel inside worker closed, should not happen: {e}");
             }
         }
@@ -332,39 +335,30 @@ impl MessageServer for DedicatedWorkerMessageServer {
 }
 
 fn get_client_connect_callback(
-    command_channel: mpsc::Sender<WorkerMessage>,
+    command_channel: mpsc::UnboundedSender<WorkerMessage>,
 ) -> Closure<dyn Fn(MessageEvent)> {
     Closure::new(move |ev: MessageEvent| {
-        let command_channel = command_channel.clone();
-        spawn_local(async move {
-            let Ok(port) = ev.ports().at(0).dyn_into() else {
-                error!("received onconnect event without MessagePort, should not happen");
-                return;
-            };
+        let Ok(port) = ev.ports().at(0).dyn_into() else {
+            error!("received onconnect event without MessagePort, should not happen");
+            return;
+        };
 
-            if let Err(e) = command_channel
-                .send(WorkerMessage::NewConnection(port))
-                .await
-            {
-                error!("command channel inside worker closed, should not happen: {e}");
-            }
-        })
+        if let Err(e) = command_channel.send(WorkerMessage::NewConnection(port)) {
+            error!("command channel inside worker closed, should not happen: {e}");
+        }
     })
 }
 
 fn get_client_message_callback(
-    command_channel: mpsc::Sender<WorkerMessage>,
+    command_channel: mpsc::UnboundedSender<WorkerMessage>,
     client: ClientId,
 ) -> Closure<dyn Fn(MessageEvent)> {
     Closure::new(move |ev: MessageEvent| {
-        let command_channel = command_channel.clone();
-        spawn_local(async move {
-            let message = WorkerMessage::from((ev, client));
+        let message = WorkerMessage::from((ev, client));
 
-            if let Err(e) = command_channel.send(message).await {
-                error!("command channel inside worker closed, should not happen: {e}");
-            }
-        })
+        if let Err(e) = command_channel.send(message) {
+            error!("command channel inside worker closed, should not happen: {e}");
+        }
     })
 }
 

@@ -139,6 +139,7 @@ from_display! {
     lumina_node::node::NodeError,
     lumina_node::store::StoreError,
     crate::worker::WorkerError,
+    tokio::sync::oneshot::error::RecvError,
 }
 
 /// Utility to add more context to the [`Error`].
@@ -153,10 +154,7 @@ pub trait Context<T> {
     where
         C: Display,
         F: FnOnce() -> C,
-        Self: Sized,
-    {
-        self.context(context_fn())
-    }
+        Self: Sized;
 }
 
 impl<T, E> Context<T> for Result<T, E>
@@ -169,6 +167,15 @@ where
     {
         self.map_err(|e| e.into().context(context))
     }
+
+    fn with_context<F, C>(self, context_fn: F) -> Result<T, Error>
+    where
+        C: Display,
+        F: FnOnce() -> C,
+        Self: Sized,
+    {
+        self.map_err(|e| e.into().context(context_fn()))
+    }
 }
 
 impl<T> Context<T> for Option<T> {
@@ -177,5 +184,14 @@ impl<T> Context<T> for Option<T> {
         C: Display,
     {
         self.ok_or_else(|| Error::new(&context.to_string()))
+    }
+
+    fn with_context<F, C>(self, context_fn: F) -> Result<T, Error>
+    where
+        C: Display,
+        F: FnOnce() -> C,
+        Self: Sized,
+    {
+        self.ok_or_else(|| Error::new(&context_fn().to_string()))
     }
 }
