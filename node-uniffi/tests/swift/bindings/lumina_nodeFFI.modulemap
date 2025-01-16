@@ -1,0 +1,4 @@
+module lumina_nodeFFI {
+    header "lumina_nodeFFI.h"
+    export *
+}
