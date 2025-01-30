@@ -7,12 +7,14 @@
 mod error;
 mod types;
 
+use blockstore::EitherBlockstore;
 use celestia_types::ExtendedHeader;
 use error::{LuminaError, Result};
-use lumina_node::{
-    blockstore::RedbBlockstore, events::EventSubscriber, node::PeerTrackerInfo, store::RedbStore,
-    Node,
-};
+use lumina_node::blockstore::{InMemoryBlockstore, RedbBlockstore};
+use lumina_node::events::EventSubscriber;
+use lumina_node::node::PeerTrackerInfo;
+use lumina_node::store::{EitherStore, InMemoryStore, RedbStore};
+use lumina_node::Node;
 use std::str::FromStr;
 use tendermint::hash::Hash;
 use tokio::sync::{Mutex, RwLock};
@@ -23,10 +25,13 @@ uniffi::setup_scaffolding!();
 
 lumina_node::uniffi_reexport_scaffolding!();
 
+pub(crate) type Blockstore = EitherBlockstore<InMemoryBlockstore, RedbBlockstore>;
+pub(crate) type Store = EitherStore<InMemoryStore, RedbStore>;
+
 /// The main Lumina node that manages the connection to the Celestia network.
 #[derive(Object)]
 pub struct LuminaNode {
-    node: RwLock<Option<Node<RedbBlockstore, RedbStore>>>,
+    node: RwLock<Option<Node<Blockstore, Store>>>,
     events_subscriber: Mutex<Option<EventSubscriber>>,
     config: NodeConfig,
 }
@@ -142,7 +147,7 @@ impl LuminaNode {
         let node = self.node.read().await;
         let node = node.as_ref().ok_or(LuminaError::NodeNotRunning)?;
         let header = node.request_head_header().await?;
-        Ok(header.to_string()) //if extended header is needed, we need a wrapper
+        Ok(serde_json::to_string(&header).unwrap()) //if extended header is needed, we need a wrapper
     }
 
     /// Request a header for the block with a given hash from the network.
@@ -151,7 +156,7 @@ impl LuminaNode {
         let node = node.as_ref().ok_or(LuminaError::NodeNotRunning)?;
         let hash = Hash::from_str(&hash).map_err(|e| LuminaError::invalid_hash(e.to_string()))?;
         let header = node.request_header_by_hash(&hash).await?;
-        Ok(header.to_string()) //if extended header is needed, we need a wrapper
+        Ok(serde_json::to_string(&header).unwrap())
     }
 
     /// Requests a header by its height.
@@ -159,7 +164,7 @@ impl LuminaNode {
         let node = self.node.read().await;
         let node = node.as_ref().ok_or(LuminaError::NodeNotRunning)?;
         let header = node.request_header_by_height(height).await?;
-        Ok(header.to_string())
+        Ok(serde_json::to_string(&header).unwrap())
     }
 
     /// Request headers in range (from, from + amount] from the network.
@@ -176,7 +181,10 @@ impl LuminaNode {
         let from: ExtendedHeader = serde_json::from_str(&from)
             .map_err(|e| LuminaError::invalid_header(format!("Invalid header JSON: {}", e)))?;
         let headers = node.request_verified_headers(&from, amount).await?;
-        Ok(headers.into_iter().map(|h| h.to_string()).collect())
+        Ok(headers
+            .into_iter()
+            .map(|h| serde_json::to_string(&h).unwrap())
+            .collect())
     }
 
     /// Gets current syncing information.
@@ -194,7 +202,7 @@ impl LuminaNode {
         let header = node.get_network_head_header().await?;
         header.map_or(
             Err(LuminaError::network("No network head header available")),
-            |h| Ok(h.to_string()),
+            |h| Ok(serde_json::to_string(&h).unwrap()),
         )
     }
 
@@ -203,7 +211,7 @@ impl LuminaNode {
         let node = self.node.read().await;
         let node = node.as_ref().ok_or(LuminaError::NodeNotRunning)?;
         let header = node.get_local_head_header().await?;
-        Ok(header.to_string())
+        Ok(serde_json::to_string(&header).unwrap())
     }
 
     /// Get a synced header for the block with a given hash.
@@ -212,7 +220,7 @@ impl LuminaNode {
         let node = node.as_ref().ok_or(LuminaError::NodeNotRunning)?;
         let hash = Hash::from_str(&hash).map_err(|e| LuminaError::invalid_hash(e.to_string()))?;
         let header = node.get_header_by_hash(&hash).await?;
-        Ok(header.to_string())
+        Ok(serde_json::to_string(&header).unwrap())
     }
 
     /// Get a synced header for the block with a given height.
@@ -220,7 +228,7 @@ impl LuminaNode {
         let node = self.node.read().await;
         let node = node.as_ref().ok_or(LuminaError::NodeNotRunning)?;
         let header = node.get_header_by_height(height).await?;
-        Ok(header.to_string())
+        Ok(serde_json::to_string(&header).unwrap())
     }
 
     /// Gets headers from the given heights range.
@@ -245,7 +253,10 @@ impl LuminaNode {
             (Some(start), Some(end)) => node.get_headers(start..=end).await,
         }?;
 
-        Ok(headers.into_iter().map(|h| h.to_string()).collect())
+        Ok(headers
+            .into_iter()
+            .map(|h| serde_json::to_string(&h).unwrap())
+            .collect())
     }
 
     /// Gets data sampling metadata for a height.
