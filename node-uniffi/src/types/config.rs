@@ -6,6 +6,10 @@ use blockstore::EitherBlockstore;
 use libp2p::identity::Keypair;
 use lumina_node::blockstore::{InMemoryBlockstore, RedbBlockstore};
 use lumina_node::network::Network;
+<<<<<<< HEAD
+=======
+use lumina_node::node::{MIN_PRUNING_DELAY, MIN_SAMPLING_WINDOW};
+>>>>>>> feat/uniffi-in-memory
 use lumina_node::store::{EitherStore, InMemoryStore, RedbStore};
 use lumina_node::NodeBuilder;
 use tokio::task::spawn_blocking;
@@ -24,9 +28,10 @@ pub struct NodeConfig {
     /// Custom list of bootstrap peers to connect to.
     /// If None, uses the canonical bootnodes for the network.
     pub bootnodes: Option<Vec<String>>,
-    /// Custom syncing window in seconds. Default is 30 days.
+    /// Custom syncing window in seconds. Default is 30 days if base path is set and 1 minute if not.
     pub syncing_window_secs: Option<u32>,
-    /// Custom pruning delay after syncing window in seconds. Default is 1 hour.
+    /// Custom pruning delay after syncing window in seconds. Default is 1 hour if base path is set
+    /// and 1 minute if not.
     pub pruning_delay_secs: Option<u32>,
     /// Maximum number of headers in batch while syncing. Default is 128.
     pub batch_size: Option<u64>,
@@ -38,8 +43,8 @@ impl NodeConfig {
     /// Convert into NodeBuilder for the implementation
     pub(crate) async fn into_node_builder(self) -> Result<NodeBuilder<Blockstore, Store>> {
         let (blockstore, store) = match self.base_path {
-            Some(base_path) => {
-                let (blockstore, store) = open_persistant_dbs(&base_path, &self.network).await?;
+            Some(ref base_path) => {
+                let (blockstore, store) = open_persistent_stores(base_path, &self.network).await?;
                 (
                     EitherBlockstore::Right(blockstore),
                     EitherStore::Right(store),
@@ -56,6 +61,14 @@ impl NodeConfig {
             .blockstore(blockstore)
             .network(self.network)
             .sync_batch_size(self.batch_size.unwrap_or(128));
+
+        // If base path is not set that means we use in-memory stores, so we
+        // adjust sampling_window and pruning_delay to avoid huge memory consumption.
+        if self.base_path.is_none() {
+            builder = builder
+                .sampling_window(MIN_SAMPLING_WINDOW)
+                .pruning_delay(MIN_PRUNING_DELAY);
+        }
 
         if let Some(bootnodes) = self.bootnodes {
             let bootnodes = bootnodes
@@ -88,7 +101,7 @@ impl NodeConfig {
     }
 }
 
-async fn open_persistant_dbs(
+async fn open_persistent_stores(
     base_path: impl AsRef<Path>,
     network: &Network,
 ) -> Result<(RedbBlockstore, RedbStore)> {

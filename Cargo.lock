@@ -3575,7 +3575,6 @@ version = "0.1.0"
 dependencies = [
  "blockstore",
  "celestia-types",
- "directories",
  "libp2p",
  "lumina-node",
  "redb",
